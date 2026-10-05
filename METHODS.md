@@ -45,6 +45,7 @@ Methods come in two forms:
 | SALT | — | `SALT` | — | — | [Li et al., 2025](https://arxiv.org/pdf/2509.24317) |
 | SimMIM | — | `SimMIM` | — | — | [Xie et al., 2022](https://arxiv.org/abs/2111.09886) |
 | SimSiam | — | `SimSiam` | — | — | [Chen & He, 2021](https://arxiv.org/abs/2011.10566) |
+| SpectralCL | `spectral_cl` | `SpectralCL` | `SpectralContrastiveLoss` | — | [HaoChen et al., 2021](https://arxiv.org/abs/2106.04156) |
 | TiCO | — | `TiCO` | — | — | [Zhu et al., 2022](https://arxiv.org/abs/2206.10698) |
 | VICRegL | — | `VICRegL` | `VICRegLoss` | — | [Bardes et al., 2022](https://arxiv.org/abs/2210.01571) |
 | VISReg | — | `VISReg` | — | — | [Wu et al., 2026](https://arxiv.org/abs/2606.02572) |
@@ -113,4 +114,5 @@ All loss classes are importable from `stable_pretraining.losses`:
 | `iBOTPatchLoss` | DINOv2, iBOT, MIMRefiner |
 | `MAELoss` | MAE |
 | `CLIPLoss` | Multimodal CLIP-style objectives |
+| `SpectralContrastiveLoss` | SpectralCL |
 | `NegativeCosineSimilarity` | SimSiam, general use |

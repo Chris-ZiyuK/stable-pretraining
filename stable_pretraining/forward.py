@@ -7,6 +7,7 @@ logic for each method and can be specified in YAML configs or Python code.
 Available forward functions:
     - ``supervised`` — standard supervised training
     - ``simclr`` — SimCLR contrastive learning
+    - ``spectral_cl`` — Spectral contrastive learning
     - ``byol`` — BYOL momentum self-distillation
     - ``vicreg`` — VICReg variance-invariance-covariance regularization
     - ``barlow_twins`` — Barlow Twins cross-correlation alignment
@@ -249,6 +250,82 @@ def simclr(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
             )
     else:
         # Single-view validation
+        out["embedding"] = self.backbone(batch["image"])
+        if "label" in batch:
+            out["label"] = batch["label"]
+
+    return out
+
+
+def spectral_cl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
+    """Forward function for Spectral Contrastive Learning.
+
+    Spectral contrastive learning pulls the embeddings of two views of an image
+    together and pushes the squared inner product of independent pairs to zero,
+    with no temperature, momentum encoder, or stop-gradient.
+
+    Args:
+        self: Module instance (automatically bound) with required attributes:
+            - backbone: Feature extraction network
+            - projector: Projection head mapping features to latent space
+            - spectral_loss: Spectral contrastive loss function
+        batch: Either a list of view dicts (from MultiViewTransform) or
+            a single dict (for validation/single-view)
+        stage: Training stage ('train', 'val', or 'test')
+
+    Returns:
+        Dictionary containing:
+            - 'embedding': Feature representations from backbone
+            - 'loss': Spectral contrastive loss (during training only)
+            - 'label': Labels if present (for probes/callbacks)
+
+    Note:
+        Introduced in HaoChen et al., NeurIPS 2021, https://arxiv.org/abs/2106.04156.
+
+    Example:
+        ::
+
+            import torch
+            import stable_pretraining as spt
+            from stable_pretraining.forward import spectral_cl
+
+            backbone = spt.backbone.from_torchvision("resnet18", low_resolution=True)
+            module = spt.Module(
+                forward=spectral_cl,
+                backbone=backbone,
+                projector=torch.nn.Linear(512, 1000),
+                spectral_loss=spt.losses.SpectralContrastiveLoss(mu=1.0),
+                optim={"optimizer": {"type": "SGD", "lr": 0.05}},
+            )
+    """
+    out = {}
+
+    views = _get_views_list(batch)
+    if views is not None:
+        if len(views) != 2:
+            raise ValueError(
+                f"Spectral contrastive learning requires exactly 2 views, got "
+                f"{len(views)}. For other configurations, please implement a "
+                "custom forward function."
+            )
+
+        embeddings = [self.backbone(view["image"]) for view in views]
+        out["embedding"] = torch.cat(embeddings, dim=0)
+
+        if "label" in views[0]:
+            out["label"] = torch.cat([view["label"] for view in views], dim=0)
+
+        if self.training:
+            projections = [self.projector(emb) for emb in embeddings]
+            out["loss"] = self.spectral_loss(projections[0], projections[1])
+            self.log(
+                f"{stage}/loss",
+                out["loss"],
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+    else:
         out["embedding"] = self.backbone(batch["image"])
         if "label" in batch:
             out["label"] = batch["label"]
