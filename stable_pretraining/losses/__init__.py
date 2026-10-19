@@ -25,9 +25,6 @@ from .multimodal import CLIPLoss
 # Reconstruction losses
 from .reconstruction import mae, MAELoss
 
-# Spectral contrastive loss
-from .spectral_contrastive import SpectralContrastiveLoss
-
 # Utilities
 from .utils import (
     sinkhorn_knopp,
@@ -48,7 +45,6 @@ __all__ = [
     "NTXEntLoss",
     "SwAVLoss",
     "CLIPLoss",
-    "SpectralContrastiveLoss",
     # Reconstruction
     "mae",
     "MAELoss",

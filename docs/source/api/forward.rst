@@ -83,27 +83,6 @@ SimCLR
         _target_: stable_pretraining.losses.NTXEntLoss
         temperature: 0.5
 
-Spectral Contrastive Learning
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. autofunction:: spectral_cl
-
-**Required Module Attributes:**
-
-- ``backbone``: Feature extraction network
-- ``projector``: Projection head for embedding transformation
-- ``spectral_loss``: Spectral contrastive loss function
-
-**Example Config:**
-
-.. code-block:: yaml
-
-    module:
-      forward: stable_pretraining.forward.spectral_cl
-      spectral_loss:
-        _target_: stable_pretraining.losses.SpectralContrastiveLoss
-        mu: 1.0
-
 NNCLR
 ~~~~~
 

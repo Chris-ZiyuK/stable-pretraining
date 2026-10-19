@@ -4,49 +4,59 @@ Follows the CIFAR-10 recipe of the authors' code for HaoChen et al., "Provable
 Guarantees for Self-Supervised Deep Learning with Spectral Contrastive Loss"
 (NeurIPS 2021): CIFAR-style ResNet-18, a BatchNorm MLP projector
 (512 -> 2048 -> 1000), SGD with momentum 0.9 and weight decay 5e-4, batch size
-512, a learning rate of ``0.03 * batch_size / 256`` with 10 warmup epochs and a
-cosine decay to zero, and the SimSiam augmentations. The paper trains for 800
-epochs; ``--loss simclr`` swaps in NT-Xent with everything else unchanged.
+512, a learning rate of ``0.03 * 512 / 256`` with 10 warmup epochs and a cosine
+decay to zero, and the SimSiam augmentations. The paper trains for 800 epochs.
 
-Usage::
-
-    python benchmarks/cifar10/spectral-resnet18.py --loss spectral --mu 1
-    python benchmarks/cifar10/spectral-resnet18.py --loss simclr --temperature 0.5
+Settings are read from environment variables: ``MAX_EPOCHS`` (default 200),
+``MU`` (spectral loss radius squared, default 1) and ``LOSS`` (``spectral`` or
+``simclr``). ``LOSS=simclr`` swaps in the SimCLR method with everything else
+unchanged.
 """
 
-import argparse
+import os
 import sys
 from pathlib import Path
 
 import lightning as pl
 import torch
+import torch.nn as nn
 import torchmetrics
 import torchvision
-from lightning.pytorch.callbacks import LearningRateMonitor
-from torch import nn
 
 import stable_pretraining as spt
-from stable_pretraining import forward
 from stable_pretraining.data import transforms
-
-sys.path.append(str(Path(__file__).parent.parent))
-from utils import get_data_dir
-
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--loss", choices=("spectral", "simclr"), default="spectral")
-parser.add_argument("--mu", type=float, default=1.0, help="spectral loss radius^2")
-parser.add_argument("--temperature", type=float, default=0.5, help="NT-Xent only")
-parser.add_argument("--epochs", type=int, default=200)
-parser.add_argument("--warmup-epochs", type=int, default=10)
-parser.add_argument("--batch-size", type=int, default=512)
-parser.add_argument("--base-lr", type=float, default=0.03, help="lr at batch size 256")
-parser.add_argument("--weight-decay", type=float, default=5e-4)
-parser.add_argument("--num-workers", type=int, default=8)
-parser.add_argument("--seed", type=int, default=0)
-args = parser.parse_args()
+from stable_pretraining.methods import SimCLR, SpectralCL
 
 
-def make_view_transform():
+def spectral_forward(self, batch, stage):
+    """Forward for two-view methods: SpectralCL and the SimCLR control.
+
+    Batch format:
+        - Training: dict with two named views, ``"view_0"`` and ``"view_1"``
+        - Eval: single dict with an ``"image"`` key
+
+    Returns:
+        Dictionary with ``"embedding"``, ``"label"`` and, in training, ``"loss"``.
+    """
+    out = {}
+
+    if self.training:
+        view_0, view_1 = batch["view_0"], batch["view_1"]
+        output = self.model(view_0["image"], view_1["image"])
+        out["label"] = torch.cat([view_0["label"], view_1["label"]])
+        out["loss"] = output.loss
+        self.log(
+            f"{stage}/loss", output.loss, on_step=True, on_epoch=True, sync_dist=True
+        )
+    else:
+        output = self.model(batch["image"])
+        out["label"] = batch["label"]
+
+    out["embedding"] = output.embedding
+    return out
+
+
+def _view_transform():
     return transforms.Compose(
         transforms.RGB(),
         transforms.RandomResizedCrop((32, 32), scale=(0.2, 1.0)),
@@ -59,126 +69,128 @@ def make_view_transform():
     )
 
 
-train_transform = transforms.MultiViewTransform(
-    [make_view_transform(), make_view_transform()]
-)
+def main():
+    sys.path.append(str(Path(__file__).parent.parent))
+    from utils import get_data_dir
 
-val_transform = transforms.Compose(
-    transforms.RGB(),
-    transforms.Resize((32, 32)),
-    transforms.ToImage(**spt.data.static.CIFAR10),
-)
+    # No per-epoch requeue checkpoint: this benchmark saves no checkpoints.
+    spt.set(requeue_checkpoint=False)
 
-data_dir = get_data_dir("cifar10")
-cifar_train = torchvision.datasets.CIFAR10(
-    root=str(data_dir), train=True, download=True
-)
-cifar_val = torchvision.datasets.CIFAR10(root=str(data_dir), train=False, download=True)
+    batch_size = 512
+    num_workers = int(os.environ.get("NUM_WORKERS", 8))
+    max_epochs = int(os.environ.get("MAX_EPOCHS", 200))
+    warmup_epochs = 10
+    mu = float(os.environ.get("MU", 1.0))
+    loss_name = os.environ.get("LOSS", "spectral")
+    base_lr = 0.03
 
-train_dataset = spt.data.FromTorchDataset(
-    cifar_train,
-    names=["image", "label"],
-    transform=train_transform,
-)
-val_dataset = spt.data.FromTorchDataset(
-    cifar_val,
-    names=["image", "label"],
-    transform=val_transform,
-)
+    train_transform = transforms.MultiViewTransform(
+        {"view_0": _view_transform(), "view_1": _view_transform()}
+    )
+    val_transform = transforms.Compose(
+        transforms.RGB(),
+        transforms.Resize((32, 32)),
+        transforms.ToImage(**spt.data.static.CIFAR10),
+    )
 
-train_dataloader = torch.utils.data.DataLoader(
-    dataset=train_dataset,
-    batch_size=args.batch_size,
-    num_workers=args.num_workers,
-    drop_last=True,
-    shuffle=True,
-    persistent_workers=args.num_workers > 0,
-)
-val_dataloader = torch.utils.data.DataLoader(
-    dataset=val_dataset,
-    batch_size=256,
-    num_workers=args.num_workers,
-)
+    data_dir = get_data_dir("cifar10")
+    cifar_train = torchvision.datasets.CIFAR10(
+        root=str(data_dir), train=True, download=True
+    )
+    cifar_val = torchvision.datasets.CIFAR10(
+        root=str(data_dir), train=False, download=True
+    )
 
-data = spt.data.DataModule(train=train_dataloader, val=val_dataloader)
+    data = spt.data.DataModule(
+        train=torch.utils.data.DataLoader(
+            dataset=spt.data.FromTorchDataset(
+                cifar_train, names=["image", "label"], transform=train_transform
+            ),
+            batch_size=batch_size,
+            num_workers=num_workers,
+            drop_last=True,
+            persistent_workers=num_workers > 0,
+            shuffle=True,
+        ),
+        val=torch.utils.data.DataLoader(
+            dataset=spt.data.FromTorchDataset(
+                cifar_val, names=["image", "label"], transform=val_transform
+            ),
+            batch_size=256,
+            num_workers=num_workers,
+        ),
+    )
 
-backbone = spt.backbone.from_torchvision(
-    "resnet18",
-    low_resolution=True,
-)
-backbone.fc = torch.nn.Identity()
+    backbone = spt.backbone.from_torchvision("resnet18", low_resolution=True)
+    backbone.fc = nn.Identity()
 
-projector = nn.Sequential(
-    nn.Linear(512, 2048),
-    nn.BatchNorm1d(2048),
-    nn.ReLU(inplace=True),
-    nn.Linear(2048, 1000),
-    nn.BatchNorm1d(1000),
-)
+    if loss_name == "spectral":
+        model = SpectralCL(encoder_name=backbone, projector_dims=(2048, 1000), mu=mu)
+    elif loss_name == "simclr":
+        model = SimCLR(
+            encoder_name=backbone, projector_dims=(2048, 1000), temperature=0.5
+        )
+    else:
+        raise ValueError(f"LOSS must be 'spectral' or 'simclr', got {loss_name!r}")
 
-if args.loss == "spectral":
-    forward_fn = forward.spectral_cl
-    loss_modules = {"spectral_loss": spt.losses.SpectralContrastiveLoss(mu=args.mu)}
-else:
-    forward_fn = forward.simclr
-    loss_modules = {"simclr_loss": spt.losses.NTXEntLoss(temperature=args.temperature)}
-
-total_steps = args.epochs * len(train_dataloader)
-
-module = spt.Module(
-    backbone=backbone,
-    projector=projector,
-    forward=forward_fn,
-    **loss_modules,
-    optim={
-        "optimizer": {
-            "type": "SGD",
-            "lr": args.base_lr * args.batch_size / 256,
-            "momentum": 0.9,
-            "weight_decay": args.weight_decay,
+    module = spt.Module(
+        model=model,
+        forward=spectral_forward,
+        optim={
+            "optimizer": {
+                "type": "SGD",
+                "lr": base_lr * batch_size / 256,
+                "momentum": 0.9,
+                "weight_decay": 5e-4,
+            },
+            "scheduler": {
+                "type": "LinearWarmupCosineAnnealing",
+                "peak_step": warmup_epochs / max_epochs,
+                "start_factor": 0.01,
+                "end_lr": 0.0,
+                "total_steps": len(data.train) * max_epochs,
+            },
+            "interval": "step",
         },
-        "scheduler": {
-            "type": "LinearWarmupCosineAnnealing",
-            "total_steps": total_steps,
-            "peak_step": args.warmup_epochs * len(train_dataloader),
-            "start_factor": 0.01,
-            "end_lr": 0.0,
-        },
-        "interval": "step",
-    },
-)
+    )
 
-linear_probe = spt.callbacks.OnlineProbe(
-    module,
-    name="linear_probe",
-    input="embedding",
-    target="label",
-    probe=torch.nn.Linear(512, 10),
-    loss=torch.nn.CrossEntropyLoss(),
-    metrics={
-        "top1": torchmetrics.classification.MulticlassAccuracy(10),
-        "top5": torchmetrics.classification.MulticlassAccuracy(10, top_k=5),
-    },
-)
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        num_sanity_val_steps=0,
+        callbacks=[
+            spt.callbacks.OnlineProbe(
+                module,
+                name="linear_probe",
+                input="embedding",
+                target="label",
+                probe=nn.Linear(model.embed_dim, 10),
+                loss=nn.CrossEntropyLoss(),
+                metrics={
+                    "top1": torchmetrics.classification.MulticlassAccuracy(10),
+                    "top5": torchmetrics.classification.MulticlassAccuracy(10, top_k=5),
+                },
+            ),
+            spt.callbacks.OnlineKNN(
+                name="knn_probe",
+                input="embedding",
+                target="label",
+                queue_length=20000,
+                metrics={
+                    "accuracy": torchmetrics.classification.MulticlassAccuracy(10)
+                },
+                input_dim=model.embed_dim,
+                k=10,
+            ),
+            pl.pytorch.callbacks.LearningRateMonitor(logging_interval="step"),
+        ],
+        logger=False,
+        precision="16-mixed",
+        enable_checkpointing=False,
+    )
 
-knn_probe = spt.callbacks.OnlineKNN(
-    name="knn_probe",
-    input="embedding",
-    target="label",
-    queue_length=20000,
-    metrics={"accuracy": torchmetrics.classification.MulticlassAccuracy(10)},
-    input_dim=512,
-    k=10,
-)
+    manager = spt.Manager(trainer=trainer, module=module, data=data, seed=0)
+    manager()
 
-trainer = pl.Trainer(
-    max_epochs=args.epochs,
-    num_sanity_val_steps=0,
-    callbacks=[knn_probe, linear_probe, LearningRateMonitor(logging_interval="step")],
-    precision="16-mixed",
-    logger=False,
-    enable_checkpointing=False,
-)
 
-manager = spt.Manager(trainer=trainer, module=module, data=data, seed=args.seed)
-manager()
+if __name__ == "__main__":
+    main()

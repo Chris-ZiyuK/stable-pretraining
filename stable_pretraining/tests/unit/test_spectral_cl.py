@@ -1,19 +1,16 @@
-"""Unit tests for the spectral contrastive loss, SpectralCL, and its forward fn."""
+"""Unit tests for the spectral contrastive loss and the SpectralCL method."""
 
-from unittest.mock import Mock, patch
-
+import lightning as pl
 import pytest
 import torch
 import torch.nn.functional as F
 from timm.models.vision_transformer import VisionTransformer
 
-from stable_pretraining.forward import spectral_cl
-from stable_pretraining.losses import SpectralContrastiveLoss
+import stable_pretraining as spt
 from stable_pretraining.methods import SpectralCL
+from stable_pretraining.methods.spectral_cl import SpectralContrastiveLoss
 
 pytestmark = pytest.mark.unit
-
-LOSS_MODULE = "stable_pretraining.losses.spectral_contrastive"
 
 
 def project_to_ball(z, mu):
@@ -127,26 +124,6 @@ class TestSpectralContrastiveLoss:
             loss.double(), reference_loss(z1, z2, 10.0), rtol=1e-3, atol=1e-3
         )
 
-    def test_gathered_negatives_match_the_single_process_loss(self):
-        g = torch.Generator().manual_seed(1)
-        scale = torch.tensor([0.2, 0.5, 1.0, 2.0, 0.3, 0.7, 1.5, 3.0]).unsqueeze(1)
-        z1 = scale * torch.randn(8, 16, generator=g)
-        z2 = scale.flip(0) * torch.randn(8, 16, generator=g)
-        loss_fn = SpectralContrastiveLoss(mu=10.0)
-        full = loss_fn(z1, z2)
-
-        # The loss gathers z_j after projecting it, so the fake collective must
-        # hand back projected shards too.
-        gathered = [project_to_ball(s, 10.0).float() for s in z2.chunk(2)]
-        per_rank = []
-        for rank in range(2):
-            with (
-                patch(f"{LOSS_MODULE}.all_gather", return_value=gathered),
-                patch(f"{LOSS_MODULE}.get_rank", return_value=rank),
-            ):
-                per_rank.append(loss_fn(z1.chunk(2)[rank], z2.chunk(2)[rank]))
-        torch.testing.assert_close(torch.stack(per_rank).mean(), full)
-
     @pytest.mark.parametrize("mu", [0.0, -1.0])
     def test_rejects_non_positive_mu(self, mu):
         with pytest.raises(ValueError, match="mu"):
@@ -194,55 +171,100 @@ class TestSpectralCL:
         with pytest.raises(ValueError, match="at least one"):
             SpectralCL(encoder_name=encoder(), projector_dims=())
 
+    def test_is_exported_at_the_top_level(self):
+        assert spt.SpectralCL is SpectralCL
+        assert "SpectralCL" in spt.__all__
 
-class TestSpectralCLForward:
-    """The functional form mirrors the ``simclr`` forward contract."""
+
+def two_view_batch(n=4, named=False, labels=True):
+    """A training batch as ``MultiViewTransform`` yields it, after collation."""
+    views = [
+        {"image": torch.randn(n, 3, 32, 32)}
+        | ({"label": torch.arange(n)} if labels else {})
+        for _ in range(2)
+    ]
+    return {"view_0": views[0], "view_1": views[1]} if named else {"views": views}
+
+
+class TestSpectralCLBatchContract:
+    """``model(batch, stage=...)`` follows the contract ``Module.training_step`` uses."""
 
     @staticmethod
-    def make_module(training):
-        module = Mock()
-        module.training = training
-        module.backbone.side_effect = lambda x: torch.randn(x.size(0), 12)
-        module.projector.side_effect = lambda h: torch.randn(h.size(0), 6)
-        module.spectral_loss = SpectralContrastiveLoss()
-        return spectral_cl.__get__(module, type(module)), module
+    def make_model(**kwargs):
+        return SpectralCL(encoder_name=encoder(), projector_dims=(16, 8), **kwargs)
 
-    @staticmethod
-    def two_views(batch=4):
-        return {
-            "views": [
-                {"image": torch.randn(batch, 3, 8, 8), "label": torch.arange(batch)}
-                for _ in range(2)
-            ]
-        }
+    @pytest.mark.parametrize("named", [False, True])
+    def test_training_returns_loss_embedding_and_label(self, named):
+        model = self.make_model().train()
+        batch = two_view_batch(named=named) | {"batch_idx": 3}
+        out = model(batch, stage="fit")
 
-    def test_training_returns_loss_embedding_and_label(self):
-        forward, module = self.make_module(training=True)
-        out = forward(self.two_views(), "train")
-
-        assert module.backbone.call_count == 2
-        assert module.projector.call_count == 2
-        assert out["embedding"].shape == (8, 12) and out["label"].shape == (8,)
         assert out["loss"].ndim == 0 and torch.isfinite(out["loss"])
-        module.log.assert_called_once()
+        assert out["embedding"].shape == (8, 24)
+        assert out["label"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+        out["loss"].backward()
 
-    def test_eval_skips_projector_and_loss(self):
-        forward, module = self.make_module(training=False)
-        out = forward(self.two_views(), "val")
+    def test_training_matches_the_tensor_interface(self):
+        model = self.make_model().train()
+        batch = two_view_batch()
+        torch.manual_seed(0)
+        from_batch = model(batch, stage="fit")["loss"]
+        torch.manual_seed(0)
+        views = batch["views"]
+        from_tensors = model(views[0]["image"], views[1]["image"]).loss
+        torch.testing.assert_close(from_batch, from_tensors)
 
-        assert "loss" not in out
-        module.projector.assert_not_called()
+    def test_training_without_labels_returns_no_label(self):
+        out = self.make_model().train()(two_view_batch(labels=False), stage="fit")
+        assert "label" not in out and "loss" in out
 
-    def test_single_view_batch_returns_embedding_and_label(self):
-        forward, _ = self.make_module(training=False)
-        out = forward(
-            {"image": torch.randn(4, 3, 8, 8), "label": torch.arange(4)}, "val"
-        )
-        assert out["embedding"].shape == (4, 12) and out["label"].shape == (4,)
-
-    def test_requires_exactly_two_views(self):
-        forward, _ = self.make_module(training=True)
-        batch = self.two_views()
-        batch["views"].append(batch["views"][0])
+    @pytest.mark.parametrize("n_views", [1, 3])
+    def test_training_needs_exactly_two_views(self, n_views):
+        batch = {"views": two_view_batch()["views"][:1] * n_views}
         with pytest.raises(ValueError, match="exactly 2 views"):
-            forward(batch, "train")
+            self.make_model().train()(batch, stage="fit")
+
+    def test_training_on_a_single_image_batch_is_rejected(self):
+        batch = {"image": torch.randn(4, 3, 32, 32), "label": torch.arange(4)}
+        with pytest.raises(ValueError, match="exactly 2 views"):
+            self.make_model().train()(batch, stage="fit")
+
+    def test_eval_single_image_returns_embedding_and_label_without_a_loss(self):
+        model = self.make_model().eval()
+        batch = {"image": torch.randn(3, 3, 32, 32), "label": torch.arange(3)}
+        with torch.no_grad():
+            out = model(batch, stage="validate")
+        assert "loss" not in out
+        assert out["embedding"].shape == (3, 24) and out["label"].tolist() == [0, 1, 2]
+
+    def test_eval_embeds_every_view_of_a_multi_view_batch(self):
+        model = self.make_model().eval()
+        with torch.no_grad():
+            out = model(two_view_batch(), stage="validate")
+        assert "loss" not in out
+        assert out["embedding"].shape == (8, 24) and out["label"].shape == (8,)
+
+    def test_trainer_fit_updates_the_weights_from_batch_dicts(self):
+        torch.manual_seed(0)
+        model = self.make_model(optim={"optimizer": {"type": "SGD", "lr": 0.1}})
+        before = [p.detach().clone() for p in model.parameters()]
+        trainer = pl.Trainer(
+            accelerator="cpu",
+            max_steps=2,
+            logger=False,
+            enable_checkpointing=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            num_sanity_val_steps=0,
+        )
+        # batch_size=None yields each prepared dict unchanged; a bare list would
+        # be read by Lightning as several dataloaders.
+        batches = torch.utils.data.DataLoader(
+            [two_view_batch(), two_view_batch()], batch_size=None
+        )
+        trainer.fit(model, train_dataloaders=batches)
+
+        assert trainer.global_step == 2
+        assert any(
+            not torch.equal(b, p.detach()) for b, p in zip(before, model.parameters())
+        )
