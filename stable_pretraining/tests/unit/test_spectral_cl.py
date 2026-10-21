@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import VisionTransformer
 
 import stable_pretraining as spt
+from stable_pretraining.losses import SpectralContrastiveLoss
 from stable_pretraining.methods import SpectralCL
-from stable_pretraining.methods.spectral_cl import SpectralContrastiveLoss
 
 pytestmark = pytest.mark.unit
 
@@ -74,14 +74,23 @@ class TestSpectralContrastiveLoss:
             loss.double(), reference_loss(z1, z2, mu), rtol=1e-4, atol=1e-4
         )
 
+    def test_is_exported_from_losses_and_preserves_the_method_import(self):
+        from stable_pretraining.methods.spectral_cl import (
+            SpectralContrastiveLoss as MethodLoss,
+        )
+
+        assert spt.losses.SpectralContrastiveLoss is SpectralContrastiveLoss
+        assert "SpectralContrastiveLoss" in spt.losses.__all__
+        assert MethodLoss is SpectralContrastiveLoss
+
     def test_default_mu_is_one(self):
         assert SpectralContrastiveLoss().mu == 1.0
 
-    def test_orthonormal_aligned_embeddings_reach_the_minimum(self):
+    def test_orthonormal_aligned_embeddings_have_expected_loss(self):
         z = torch.eye(5, 8)
         assert SpectralContrastiveLoss(mu=None)(z, z).item() == pytest.approx(-2.0)
 
-    def test_the_minimum_is_independent_of_mu_on_the_ball_boundary(self):
+    def test_aligned_orthogonal_embeddings_reach_lower_bound_on_ball_boundary(self):
         mu = 3.0
         z = mu**0.5 * torch.eye(5, 8)
         assert SpectralContrastiveLoss(mu=mu)(z, z).item() == pytest.approx(-2.0)
@@ -114,6 +123,24 @@ class TestSpectralContrastiveLoss:
         SpectralContrastiveLoss()(z1, z2).backward()
         for z in (z1, z2):
             assert torch.isfinite(z.grad).all() and z.grad.abs().sum() > 0
+
+    @pytest.mark.parametrize("small_value", [0.0, 1e-20])
+    @pytest.mark.parametrize("mu", [0.5, 1.0, 10.0])
+    def test_tiny_rows_have_the_unprojected_gradient_inside_the_ball(
+        self, small_value, mu
+    ):
+        z1 = torch.full((2, 2), small_value, requires_grad=True)
+        z2 = torch.tensor([[0.25, -0.5], [-0.125, 0.25]], requires_grad=True)
+        loss = SpectralContrastiveLoss(mu=mu)(z1, z2)
+        expected = SpectralContrastiveLoss(mu=None)(z1, z2) / mu
+        actual_grads = torch.autograd.grad(loss, (z1, z2))
+        expected_grads = torch.autograd.grad(expected, (z1, z2))
+
+        assert torch.isfinite(loss)
+        torch.testing.assert_close(loss, expected, rtol=1e-6, atol=0)
+        for actual, reference in zip(actual_grads, expected_grads):
+            assert torch.isfinite(actual).all()
+            torch.testing.assert_close(actual, reference, rtol=1e-6, atol=0)
 
     def test_loss_is_float32_under_autocast(self, views):
         z1, z2 = (v.bfloat16() for v in views)

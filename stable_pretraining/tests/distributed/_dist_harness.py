@@ -11,6 +11,7 @@ are only invoked by tests gated on ``>=2`` visible CUDA devices.
 """
 
 import os
+import queue
 import socket
 import traceback
 
@@ -52,7 +53,9 @@ def _worker(rank, world_size, backend, port, fn, error_queue):
             dist.destroy_process_group()
 
 
-def run_distributed(fn, world_size: int = 2, backend: str = "gloo", timeout: int = 120):
+def run_distributed(
+    fn, world_size: int = 2, backend: str = "gloo", timeout: float = 120
+):
     """Spawn ``world_size`` procs, run ``fn(rank, world_size)`` in each, re-raise failures.
 
     Args:
@@ -62,7 +65,8 @@ def run_distributed(fn, world_size: int = 2, backend: str = "gloo", timeout: int
         timeout: Per-process join timeout in seconds.
 
     Raises:
-        AssertionError: If any rank raised, with the rank-sorted tracebacks.
+        AssertionError: If any rank raised, exited unsuccessfully, or timed out.
+            Worker exceptions include the rank-sorted tracebacks.
     """
     ctx = mp.get_context("spawn")
     error_queue = ctx.Queue()
@@ -76,17 +80,32 @@ def run_distributed(fn, world_size: int = 2, backend: str = "gloo", timeout: int
     ]
     for p in procs:
         p.start()
-    for p in procs:
+    timed_out = []
+    for rank, p in enumerate(procs):
         p.join(timeout)
+        if p.is_alive():
+            timed_out.append(rank)
 
     errors = []
-    while not error_queue.empty():
-        errors.append(error_queue.get())
+    while True:
+        try:
+            errors.append(error_queue.get_nowait())
+        except queue.Empty:
+            break
     for p in procs:
         if p.is_alive():
             p.terminate()
             p.join()
 
+    errors.extend(
+        (rank, f"Worker timed out after {timeout} seconds") for rank in timed_out
+    )
+    errors.extend(
+        (rank, f"Worker exited with code {p.exitcode}")
+        for rank, p in enumerate(procs)
+        if rank not in timed_out and p.exitcode != 0
+    )
+    error_queue.close()
     if errors:
         errors.sort(key=lambda rt: rt[0])
         report = "\n\n".join(f"--- rank {r} ---\n{tb}" for r, tb in errors)
