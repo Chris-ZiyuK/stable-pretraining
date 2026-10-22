@@ -8,15 +8,6 @@ References:
     HaoChen et al., "Provable Guarantees for Self-Supervised Deep Learning with
     Spectral Contrastive Loss", NeurIPS 2021. https://arxiv.org/abs/2106.04156
 
-Example::
-
-    from stable_pretraining.methods import SpectralCL
-    import lightning as pl
-
-    model = SpectralCL(encoder_name="resnet18", low_resolution=True)
-
-    trainer = pl.Trainer(max_epochs=200)
-    trainer.fit(model, dataloader)
 """
 
 from dataclasses import dataclass
@@ -34,11 +25,14 @@ from stable_pretraining.losses import SpectralContrastiveLoss
 
 @dataclass
 class SpectralCLOutput(ModelOutput):
-    """Output from SpectralCL forward pass.
+    """Output from the tensor interface of SpectralCL.
 
-    :ivar loss: Spectral contrastive loss (0 in eval mode)
-    :ivar embedding: Backbone features [B, D] in eval mode, [2B, D] in train mode
-    :ivar projection: Projector outputs [2B, P] (None in eval mode)
+    Attributes:
+        loss: Spectral contrastive loss for two views, or zero for one view.
+        embedding: Backbone features of shape ``[2B, D]`` for two views, or
+            ``[B, D]`` for one view.
+        projection: Projector outputs of shape ``[2B, P]`` for two views, or
+            ``None`` for one view.
     """
 
     loss: torch.Tensor = None
@@ -49,8 +43,15 @@ class SpectralCLOutput(ModelOutput):
 def _build_spectral_projector(in_dim: int, hidden_dims: Sequence[int]) -> nn.Module:
     """MLP projector: Linear -> BN -> ReLU -> ... -> Linear -> BN.
 
-    :param in_dim: Backbone output dimension
-    :param hidden_dims: Sequence of hidden + output dimensions, e.g. (2048, 1000)
+    Args:
+        in_dim: Backbone output dimension.
+        hidden_dims: Hidden and output dimensions, e.g. ``(2048, 1000)``.
+
+    Returns:
+        Sequential projector with BatchNorm after every linear layer.
+
+    Raises:
+        ValueError: If ``hidden_dims`` is empty.
     """
     if len(hidden_dims) < 1:
         raise ValueError("hidden_dims must contain at least one entry (the output dim)")
@@ -76,57 +77,60 @@ class SpectralCL(Module):
         - **Loss**: spectral contrastive loss on projections confined to the
           ball of radius ``sqrt(mu)``
 
-    :param encoder_name: timm model name (e.g. ``"resnet18"``,
-        ``"vit_small_patch16_224"``) or a pre-instantiated ``nn.Module`` whose
-        ``forward`` returns a ``[B, D]`` tensor.
-    :param projector_dims: Hidden + output dimensions of the MLP projector. The
-        default ``(2048, 1000)`` is what the authors' CIFAR-10 code builds; the
-        paper text describes 1000 hidden units.
-    :param mu: Squared radius of the ball the projections are confined to. The
-        paper tunes it over ``{1, 3, 10}`` on CIFAR and uses 10 on ImageNet.
-    :param low_resolution: Adapt first conv for 32x32 inputs (CIFAR-style).
-    :param pretrained: Load pretrained timm weights for the encoder.
-    :param optim: Optimizer configuration in the format of
-        :class:`~stable_pretraining.Module`. Needed to train the model directly
-        through ``Trainer`` / ``Manager``.
+    Args:
+        encoder_name: timm model name (e.g. ``"resnet18"`` or
+            ``"vit_small_patch16_224"``), or an ``nn.Module`` whose ``forward``
+            returns a ``[B, D]`` tensor.
+        projector_dims: Hidden and output dimensions of the MLP projector. The
+            default ``(2048, 1000)`` matches the authors' CIFAR-10 code; the
+            paper text describes 1000 hidden units.
+        mu: Squared radius of the ball the projections are confined to. The
+            paper tunes it over ``{1, 3, 10}`` on CIFAR and uses 10 on ImageNet.
+        low_resolution: Adapt the first convolution for 32x32 inputs.
+        pretrained: Load pretrained timm weights for the encoder.
+        optim: Optional optimizer configuration in the format of
+            :class:`~stable_pretraining.Module`. When omitted, Module uses its
+            default AdamW optimizer and cosine scheduler.
 
     The model supports two calling conventions:
 
     - **Tensors**: ``model(view1, view2)`` returns a :class:`SpectralCLOutput`.
     - **Batch dicts**: ``model(batch, stage=...)`` is the contract used by
-      :class:`~stable_pretraining.Module`, so the model trains directly with
-      ``Trainer`` / ``Manager`` on batches from ``MultiViewTransform``. It
-      returns a dict with ``"embedding"``, ``"label"`` when the views carry
-      labels, and ``"loss"`` in training mode.
+      :class:`~stable_pretraining.Module`, so the model trains with
+      :class:`~stable_pretraining.Manager` on batches from
+      ``MultiViewTransform``. It returns a dict with ``"embedding"``,
+      ``"label"`` when the views carry labels, and ``"loss"`` in training mode.
 
-    Example::
+    Training with a supplied ``data`` DataModule whose training batches contain
+    two view dicts under ``"views"`` (each with an ``"image"`` tensor)::
 
-        model = SpectralCL(
+        import lightning as pl
+        import stable_pretraining as spt
+
+        model = spt.SpectralCL(encoder_name="resnet18", low_resolution=True)
+        trainer = pl.Trainer(max_epochs=200)
+        spt.Manager(trainer=trainer, module=model, data=data)()
+
+    Using the tensor interface::
+
+        import torch
+        import stable_pretraining as spt
+
+        model = spt.SpectralCL(
             encoder_name="resnet18",
             projector_dims=(2048, 1000),
             mu=1.0,
             low_resolution=True,
         )
 
-        v1 = torch.randn(64, 3, 32, 32)
-        v2 = torch.randn(64, 3, 32, 32)
+        v1 = torch.randn(4, 3, 32, 32)
+        v2 = torch.randn(4, 3, 32, 32)
         out = model(v1, v2)
         out.loss.backward()
 
-        # eval: single view, no loss
         model.eval()
-        out = model(v1)
-        features = out.embedding  # [64, embed_dim]
-
-    Example with Manager::
-
-        model = SpectralCL(
-            encoder_name="resnet18",
-            low_resolution=True,
-            optim={"optimizer": {"type": "SGD", "lr": 0.06, "momentum": 0.9}},
-        )
-        trainer = pl.Trainer(max_epochs=200)
-        spt.Manager(trainer=trainer, module=model, data=data)()
+        with torch.no_grad():
+            features = model(v1).embedding
     """
 
     def __init__(
@@ -137,7 +141,7 @@ class SpectralCL(Module):
         low_resolution: bool = False,
         pretrained: bool = False,
         optim: Optional[dict] = None,
-    ):
+    ) -> None:
         super().__init__(**({} if optim is None else {"optim": optim}))
 
         if isinstance(encoder_name, str):
@@ -166,13 +170,17 @@ class SpectralCL(Module):
     ) -> Union[SpectralCLOutput, dict[str, torch.Tensor]]:
         """Forward pass.
 
-        :param view1: First augmented view [B, C, H, W] (or single view at eval),
-            or a batch dict, in which case ``view2`` must be ``None``.
-        :param view2: Second augmented view [B, C, H, W]. If ``None``, returns
-            only the backbone embedding (eval mode).
-        :param stage: Lightning stage, only used to name the logged loss when a
-            batch dict is given.
-        :return: :class:`SpectralCLOutput` for tensors, a dict for a batch dict.
+        Args:
+            view1: First augmented view of shape ``[B, C, H, W]``, or a batch
+                dict, in which case ``view2`` must be ``None``.
+            view2: Second augmented view of shape ``[B, C, H, W]``. If omitted
+                for tensor input, returns backbone features, a zero loss, and
+                no projection, regardless of training mode.
+            stage: Lightning stage, used to name the logged loss for batch dicts.
+
+        Returns:
+            :class:`SpectralCLOutput` for tensors, or a dict with embeddings,
+            labels when supplied, and a loss during training for batch dicts.
         """
         if isinstance(view1, dict):
             return self._forward_batch(view1, stage)
@@ -199,7 +207,12 @@ class SpectralCL(Module):
     def _forward_batch(self, batch: dict, stage: Optional[str]) -> dict:
         """Forward a batch dict, as :class:`~stable_pretraining.Module` calls it.
 
-        Training needs exactly two views. At eval a single ``{"image": ...}`` batch
-        or any number of views is embedded, and no loss is returned.
+        Args:
+            batch: Two views during training, or a single ``{"image": ...}``
+                batch or multiple views during evaluation.
+            stage: Lightning stage for loss logging; defaults to ``"fit"``.
+
+        Returns:
+            Embeddings, optional labels, and a loss only during training.
         """
         return spectral(self, batch, stage or "fit")
